@@ -451,6 +451,7 @@ int zut_bpxwdyn_common(const std::string &parm, unsigned int *code, std::string 
   }
 
   bparm->len = sprintf(bparm->str, "%s", parm.c_str());
+
   int rc = ZUTWDYN(bparm, response);
 
   if (bparm->rtdd)
@@ -971,7 +972,7 @@ int zut_loop_dynalloc(ZDIAG &diag, const std::vector<std::string> &list)
       diag.detail_rc = ZUT_RTNCD_SERVICE_FAILURE;
       diag.service_rc = rc;
       strcpy(diag.service_name, "bpxwdyn");
-      diag.e_msg_len = sprintf(diag.e_msg, "bpxwdyn failed with '%s' rc: '%d', emsg: '%s'", diag.service_name, rc, alloc.c_str());
+      diag.e_msg_len = sprintf(diag.e_msg, "bpxwdyn failed with '%s' rc: '%d', emsg: '%s'", diag.service_name, rc, response.c_str());
       return RTNCD_FAILURE;
     }
   }
