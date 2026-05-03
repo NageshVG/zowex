@@ -211,4 +211,75 @@ Host server
         const result = await SshConfigUtils.migrateSshConfig();
         expect(result[0].handshakeTimeout).toBe(45000);
     });
+
+describe("clearCache", () => {
+    const mockReadFileSync = readFileSync as ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        SshConfigUtils.clearCache();
+    });
+
+    it("should cache SSH config results", async () => {
+        const configContent = `
+Host server1
+    HostName example.com
+    User user1
+`;
+        mockReadFileSync.mockReturnValue(configContent);
+
+        // First call should read the file
+        const result1 = await SshConfigUtils.migrateSshConfig();
+        expect(mockReadFileSync).toHaveBeenCalledTimes(1);
+
+        // Second call should use cache
+        const result2 = await SshConfigUtils.migrateSshConfig();
+        expect(mockReadFileSync).toHaveBeenCalledTimes(1); // Still 1, not 2
+        expect(result2).toEqual(result1);
+    });
+
+    it("should clear cache when clearCache is called", async () => {
+        const configContent = `
+Host server1
+    HostName example.com
+`;
+        mockReadFileSync.mockReturnValue(configContent);
+
+        // First call
+        await SshConfigUtils.migrateSshConfig();
+        expect(mockReadFileSync).toHaveBeenCalledTimes(1);
+
+        // Clear cache
+        SshConfigUtils.clearCache();
+
+        // Second call should read file again
+        await SshConfigUtils.migrateSshConfig();
+        expect(mockReadFileSync).toHaveBeenCalledTimes(2);
+    });
+
+    it("should expire cache after TTL", async () => {
+        vi.useFakeTimers();
+        const configContent = `
+Host server1
+    HostName example.com
+`;
+        mockReadFileSync.mockReturnValue(configContent);
+
+        // First call
+        await SshConfigUtils.migrateSshConfig();
+        expect(mockReadFileSync).toHaveBeenCalledTimes(1);
+
+        // Advance time by 4 seconds (within TTL)
+        vi.advanceTimersByTime(4000);
+        await SshConfigUtils.migrateSshConfig();
+        expect(mockReadFileSync).toHaveBeenCalledTimes(1); // Still cached
+
+        // Advance time by 2 more seconds (total 6 seconds, beyond 5-second TTL)
+        vi.advanceTimersByTime(2000);
+        await SshConfigUtils.migrateSshConfig();
+        expect(mockReadFileSync).toHaveBeenCalledTimes(2); // Cache expired, file read again
+
+        vi.useRealTimers();
+    });
+});
 });
