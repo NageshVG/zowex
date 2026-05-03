@@ -4,6 +4,10 @@ All notable changes to the "zowex-vsce" extension will be documented in this fil
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## `0.6.0`
+
+- Added `refreshSshConfig` command to refresh SSH config cache.
+
 ## `0.5.0`
 
 - **Breaking:** Renamed contributed setting IDs from `zowe-native-proto` to `zowex`. All references to `zowe-native-proto` should be replaced with `zowex` in VS Code `settings.json` files. [#831](https://github.com/zowe/zowex/issues/831)
