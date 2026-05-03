@@ -64,8 +64,63 @@ export class ZSshClient extends RpcClientApi implements Disposable {
                 reject(err);
             });
             client.mSshClient.on("ready", async () => {
-                const zowexBin = posix.join(opts.serverPath ?? ZSshClient.DEFAULT_SERVER_PATH, "zowex");
-                const serverArgs = ["server"];
+                const serverPath = opts.serverPath ?? ZSshClient.DEFAULT_SERVER_PATH;
+                // Try zowex first (new version), fall back to zowed (old version)
+                const zowexBin = posix.join(serverPath, "zowex");
+                const zowedBin = posix.join(serverPath, "zowed");
+                const serverArgs = [];
+                
+                // Check if zowex exists, otherwise use zowed
+                let binPath = zowexBin;
+                let useNewVersion = true;
+                
+                try {
+                    // Try to check if zowex exists with a timeout
+                    await new Promise<void>((resolve, reject) => {
+                        const timeout = setTimeout(() => {
+                            reject(new Error("File check timeout"));
+                        }, 5000); // 5 second timeout
+                        
+                        client.mSshClient.exec(`test -f ${zowexBin}`, (err, stream) => {
+                            if (err) {
+                                clearTimeout(timeout);
+                                reject(err);
+                                return;
+                            }
+                            
+                            stream.on('close', (code: number) => {
+                                clearTimeout(timeout);
+                                if (code !== 0) {
+                                    // zowex doesn't exist, use zowed
+                                    binPath = zowedBin;
+                                    useNewVersion = false;
+                                }
+                                resolve();
+                            });
+                            
+                            stream.on('error', (err: Error) => {
+                                clearTimeout(timeout);
+                                reject(err);
+                            });
+                            
+                            // Consume any output to prevent hanging
+                            stream.on('data', () => {});
+                            stream.stderr.on('data', () => {});
+                        });
+                    });
+                } catch (err) {
+                    Logger.getAppLogger().warn(`Failed to check for zowex, falling back to zowed: ${err}`);
+                    binPath = zowedBin;
+                    useNewVersion = false;
+                }
+                
+                Logger.getAppLogger().debug(`Using server binary: ${binPath} (new version: ${useNewVersion})`);
+                
+                // Add 'server' subcommand only for new version
+                if (useNewVersion) {
+                    serverArgs.push("server");
+                }
+                
                 if (opts.numWorkers != null) {
                     serverArgs.push("--num-workers", `${opts.numWorkers}`);
                 }
@@ -75,7 +130,7 @@ export class ZSshClient extends RpcClientApi implements Disposable {
                 if (opts.verbose) {
                     serverArgs.push("--verbose");
                 }
-                client.execAsync(zowexBin, ...serverArgs).then(resolve, reject);
+                client.execAsync(binPath, ...serverArgs).then(resolve, reject);
             });
             client.mSshClient.on("close", () => {
                 Logger.getAppLogger().debug("Client disconnected");

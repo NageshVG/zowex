@@ -27,6 +27,10 @@
         "title": "Zowe-SSH: Restart Zowe Server on Host..."
       },
       {
+        "command": "zowe-native-proto-vsce.refreshSshConfig",
+        "title": "Zowe-SSH: Refresh SSH Config"
+      },
+      {
         "command": "zowex-vsce.showLog",
         "title": "Zowe-SSH: Show Log"
       },

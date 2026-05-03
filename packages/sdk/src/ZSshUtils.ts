@@ -73,33 +73,108 @@ export class ZSshUtils {
     }
 
     public static buildSession(args: IProfile): SshSession {
+        const logger = Logger.getAppLogger();
+        logger.debug(`Building session for ${args.host}`);
+        logger.debug(`Profile has: user=${args.user}, privateKey=${args.privateKey}, password=${!!args.password}`);
+        
         const sshSessCfg: ISshSession = {
             hostname: args.host,
             port: args.port ?? 22,
             user: args.user,
             privateKey: args.privateKey,
             keyPassphrase: args.privateKey ? args.keyPassphrase : undefined,
-            password: args.privateKey ? undefined : args.password,
+            password: args.password, // Allow password as fallback even when privateKey is set
             handshakeTimeout: args.handshakeTimeout,
         };
+        
+        logger.debug(`Session config: user=${sshSessCfg.user}, privateKey=${sshSessCfg.privateKey}, password=${!!sshSessCfg.password}`);
         return new SshSession(sshSessCfg);
     }
 
     public static buildSshConfig(session: SshSession, configProps?: ConnectConfig): ConnectConfig {
-        return {
+        const logger = Logger.getAppLogger();
+        logger.debug(`Building SSH config for ${session.ISshSession.hostname}`);
+        
+        const config: ConnectConfig = {
             host: session.ISshSession.hostname,
             port: session.ISshSession.port,
             username: session.ISshSession.user,
-            password: session.ISshSession.password,
+            // Treat empty string and null password as undefined (used for SSH agent profiles)
+            password: session.ISshSession.password && session.ISshSession.password.length > 0
+                ? session.ISshSession.password
+                : undefined,
             privateKey: session.ISshSession.privateKey
                 ? fs.readFileSync(session.ISshSession.privateKey, "utf-8")
                 : undefined,
             passphrase: session.ISshSession.keyPassphrase,
             readyTimeout: session.ISshSession.handshakeTimeout,
+            tryKeyboard: true, // Enable keyboard-interactive authentication
             // ssh2 debug messages are extremely verbose so log at TRACE level
-            debug: (msg) => Logger.getAppLogger().trace(msg),
+            debug: (msg) => logger.trace(msg),
             ...configProps,
         };
+
+        // If no explicit authentication method is provided, try SSH agent first, then default keys
+        // Empty string and null password are treated as no password (for SSH agent profiles)
+        if (!config.privateKey && !config.password) {
+            logger.debug(`No explicit auth for ${session.ISshSession.hostname}, trying SSH agent first`);
+            
+            // Try SSH agent first - prioritize 1Password agent over SSH_AUTH_SOCK
+            let agentFound = false;
+            
+            // Try 1Password agent path first (more reliable than SSH_AUTH_SOCK)
+            const onePasswordAgent = path.join(
+                require("node:os").homedir(),
+                "Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
+            );
+            try {
+                fs.accessSync(onePasswordAgent);
+                logger.debug(`Using 1Password agent: ${onePasswordAgent}`);
+                config.agent = onePasswordAgent;
+                config.agentForward = true; // Enable agent forwarding when using agent
+                agentFound = true;
+            } catch {
+                logger.debug(`1Password agent not available at ${onePasswordAgent}`);
+                
+                // Fall back to SSH_AUTH_SOCK if 1Password agent not found
+                if (process.env.SSH_AUTH_SOCK) {
+                    logger.debug(`Using SSH agent from SSH_AUTH_SOCK: ${process.env.SSH_AUTH_SOCK}`);
+                    config.agent = process.env.SSH_AUTH_SOCK;
+                    config.agentForward = true; // Enable agent forwarding when using agent
+                    agentFound = true;
+                }
+            }
+            
+            // Only try default SSH keys if no agent was found
+            if (!agentFound) {
+                logger.debug(`No SSH agent found, trying default SSH keys`);
+                
+                const defaultKeyPaths = [
+                    path.join(require("node:os").homedir(), ".ssh", "id_rsa"),
+                    path.join(require("node:os").homedir(), ".ssh", "id_ed25519"),
+                    path.join(require("node:os").homedir(), ".ssh", "id_ecdsa"),
+                    path.join(require("node:os").homedir(), ".ssh", "id_dsa"),
+                ];
+                
+                for (const keyPath of defaultKeyPaths) {
+                    try {
+                        const keyContent = fs.readFileSync(keyPath, "utf-8");
+                        config.privateKey = keyContent;
+                        logger.debug(`Using default SSH key: ${keyPath}`);
+                        break; // Use first readable key
+                    } catch {
+                        // Key doesn't exist or can't be read, try next
+                    }
+                }
+            }
+        } else if (config.privateKey) {
+            logger.debug(`Using explicit private key for ${session.ISshSession.hostname}`);
+        } else if (config.password) {
+            logger.debug(`Using password authentication for ${session.ISshSession.hostname}`);
+        }
+
+        logger.debug(`Final config: agent=${!!config.agent}, privateKey=${!!config.privateKey}, password=${!!config.password}`);
+        return config;
     }
 
     public static async installServer(

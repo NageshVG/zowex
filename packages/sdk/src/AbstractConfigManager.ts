@@ -24,6 +24,7 @@ import {
     type IProfile,
     type IProfileLoaded,
     type IProfileTypeConfiguration,
+    Logger,
     type ProfileInfo,
 } from "@zowe/imperative";
 import type { ISshSession } from "@zowe/zos-uss-for-zowe-sdk";
@@ -62,6 +63,8 @@ export abstract class AbstractConfigManager {
     private sshProfiles: IProfileLoaded[];
     private sshRegex = /^ssh\s+(?:([a-zA-Z0-9_-]+)@)?([a-zA-Z0-9.-]+)/;
     private flagRegex = /-(\w+)(?:\s+("[^"]+"|'[^']+'|\S+))?/g;
+    // Track profiles that successfully authenticated via SSH agent (for manual connections)
+    private sshAgentProfiles: Set<string> = new Set();
 
     public async promptForProfile(
         profileName?: string,
@@ -79,8 +82,8 @@ export abstract class AbstractConfigManager {
 
         this.sshProfiles = this.fetchAllSshProfiles().filter(({ name, profile }) => name && profile?.host);
 
-        // Get configs from ~/.ssh/config
-        this.migratedConfigs = await SshConfigUtils.migrateSshConfig();
+        // Get configs from ~/.ssh/config (force refresh to pick up any recent changes)
+        this.migratedConfigs = await SshConfigUtils.migrateSshConfig(true);
 
         // Parse to remove migratable configs that already exist on the team config
         this.filteredMigratedConfigs = this.migratedConfigs.filter(
@@ -88,6 +91,7 @@ export abstract class AbstractConfigManager {
                 !this.sshProfiles.some((sshProfile) => sshProfile.profile?.host === migratedConfig.hostname),
         );
 
+        // Build menu items with enhanced SSH config display
         const menuItems: qpItem[] = [];
 
         // Add "Create New SSH Host" option if profile creation is enabled
@@ -95,29 +99,37 @@ export abstract class AbstractConfigManager {
             menuItems.push({ label: "$(plus) Add New SSH Host..." });
         }
 
-        // Add existing SSH profiles
-        this.sshProfiles.forEach(({ name, profile }) => {
-            menuItems.push({
-                label: name!,
-                description: profile!.host!,
-            });
-        });
-
-        // Add migration options if profile creation is enabled and configs are available
-        if (!disableCreateNewProfile && this.filteredMigratedConfigs.length > 0) {
-            menuItems.push({
-                label: "Migrate From SSH Config",
-                separator: true,
-            });
-
-            this.filteredMigratedConfigs.forEach(({ name, hostname }) => {
+        // Add existing Zowe profiles
+        if (this.sshProfiles.length > 0) {
+            menuItems.push({ label: "Zowe SSH Profiles", separator: true });
+            this.sshProfiles.forEach(({ name, profile }) => {
                 menuItems.push({
                     label: name!,
-                    description: hostname,
+                    description: profile!.host!,
                 });
             });
         }
 
+        // Add SSH config profiles (show all, not just filtered ones) with enhanced display
+        if (!disableCreateNewProfile && this.migratedConfigs.length > 0) {
+            menuItems.push({ label: "SSH Config Profiles (~/.ssh/config)", separator: true });
+            this.migratedConfigs.forEach(({ name, hostname, user, privateKey, port }) => {
+                const details: string[] = [];
+                if (user) details.push(`${user}@${hostname}`);
+                else details.push(hostname!);
+                if (port && port !== 22) details.push(`port ${port}`);
+                if (privateKey) {
+                    const keyName = path.basename(privateKey);
+                    details.push(`🔑 ${keyName}`);
+                }
+                menuItems.push({
+                    label: name!,
+                    description: details.join(" • "),
+                });
+            });
+        }
+
+        // Prompt user for ssh (new config, existing, migrating)
         let result: qpItem | undefined;
 
         if (disableCreateNewProfile) {
@@ -140,8 +152,21 @@ export abstract class AbstractConfigManager {
         if (!result) return;
 
         // If result is add new SSH host then create a new config, if not use migrated configs
-        this.selectedProfile = this.filteredMigratedConfigs.find(
-            ({ name, hostname }) => result?.label === name && result?.description === hostname,
+        this.selectedProfile = this.migratedConfigs.find(
+            ({ name, hostname, user, privateKey, port }) => {
+                if (result?.label !== name) return false;
+                
+                // Build the same description format to match
+                const details: string[] = [];
+                if (user) details.push(`${user}@${hostname}`);
+                else details.push(hostname!);
+                if (port && port !== 22) details.push(`port ${port}`);
+                if (privateKey) {
+                    const keyName = path.basename(privateKey);
+                    details.push(`🔑 ${keyName}`);
+                }
+                return result?.description === details.join(" • ");
+            }
         );
 
         if (result.description === "Custom SSH Host") {
@@ -185,8 +210,23 @@ export abstract class AbstractConfigManager {
             }
         }
 
-        const useProject = prioritizeProjectLevelConfig && this.getCurrentDir() !== undefined;
-        await this.createZoweSchema(!useProject);
+        // Check if this profile is from SSH config (either SSH agent or custom private key)
+        const profileKey = this.selectedProfile ?
+            `${this.selectedProfile.hostname}:${this.selectedProfile.user}` : '';
+        const isFromSshConfig = this.selectedProfile && this.migratedConfigs.some(
+            (config) => config.hostname === this.selectedProfile?.hostname &&
+                       config.user === this.selectedProfile?.user
+        );
+        const usesSshAgent = this.selectedProfile?.useSshAgent ||
+                             this.sshAgentProfiles.has(profileKey);
+        
+        // For profiles from SSH config OR using SSH agent, skip creating project config
+        // since we'll write to global config
+        // For manually created profiles, prioritize creating a team config in the local workspace if it exists
+        if (!isFromSshConfig && !usesSshAgent) {
+            const useProject = prioritizeProjectLevelConfig && this.getCurrentDir() !== undefined;
+            await this.createZoweSchema(!useProject);
+        }
 
         // Prompt for a new profile name with the hostname (for adding a new config) or host value (for migrating from a config)
         this.selectedProfile = await this.getNewProfileName(this.selectedProfile!, this.mProfilesCache.getTeamConfig());
@@ -201,28 +241,80 @@ export abstract class AbstractConfigManager {
             const statusBar = this.showStatusBar();
             this.validationResult = await this.validateConfig(this.selectedProfile, false);
             statusBar?.dispose();
+            
+            // If we have a private key from SSH config, don't fall through to password prompts
+            // Mark as validated (even if it failed) to prevent password prompts
+            if (this.validationResult === undefined) {
+                this.validationResult = {}; // Empty object means validation attempted but no modifications needed
+            }
         }
 
+        // If no explicit private key, try to find and validate with default SSH keys
+        // This handles cases where SSH config has user but no IdentityFile (relies on SSH agent or default keys)
         if (this.validationResult === undefined) {
             const statusBar = this.showStatusBar();
             await this.validateFoundPrivateKeys();
             statusBar?.dispose();
+            
+            // If we found and validated with a key, mark as done to prevent password prompts
+            // Skip password prompt if this profile is from SSH config OR uses SSH agent
+            const profileKey = `${this.selectedProfile?.hostname}:${this.selectedProfile?.user}`;
+            const isFromSshConfig = this.migratedConfigs.some(
+                (config) => config.hostname === this.selectedProfile?.hostname &&
+                           config.user === this.selectedProfile?.user
+            );
+            const usesSshAgent = this.selectedProfile?.useSshAgent ||
+                                 this.sshAgentProfiles.has(profileKey);
+            
+            if (this.validationResult === undefined && this.selectedProfile.user &&
+                (isFromSshConfig || usesSshAgent)) {
+                // If we have a user from SSH config or SSH agent but no password, don't ask for one
+                // This allows SSH agent authentication to work
+                this.validationResult = {}; // Mark as validated to prevent password prompts
+            }
         }
 
         if (this.validationResult === undefined) {
             const statusBar = this.showStatusBar();
             // Attempt to validate with given URL/creds
-            this.validationResult = await this.validateConfig(this.selectedProfile);
+            // Don't ask for password if we already have a private key from SSH config
+            const shouldAskForPassword = !this.selectedProfile.privateKey;
+            this.validationResult = await this.validateConfig(this.selectedProfile, shouldAskForPassword);
             statusBar?.dispose();
         }
 
-        // If validateConfig returns a string, that string is the correct keyPassphrase
+        // If validateConfig returns modifications, merge them with the selected profile
         if (this.validationResult && Object.keys(this.validationResult).length >= 1) {
-            this.selectedProfile.privateKey = this.selectedProfile.keyPassphrase = undefined;
+            // Only clear privateKey/keyPassphrase if password authentication was used
+            if (this.validationResult.password) {
+                this.selectedProfile.privateKey = this.selectedProfile.keyPassphrase = undefined;
+            }
             this.selectedProfile = { ...this.selectedProfile, ...this.validationResult };
         }
-        // If no private key or password is on the profile then there is no possible validation combination, thus return
-        if (!this.selectedProfile?.privateKey && !this.selectedProfile?.password) {
+        // If we have a user from SSH config but no password or private key, allow it
+        // This supports SSH agent authentication and server-side authorized_keys
+        // Don't require password for SSH config profiles with user configured
+        const hasUserFromSshConfig = this.selectedProfile?.user &&
+            this.migratedConfigs.some(config =>
+                // Match by hostname and user (name might have changed during profile creation)
+                config.hostname === this.selectedProfile?.hostname &&
+                config.user === this.selectedProfile?.user
+            );
+        
+        // If no private key or password is on the profile, check if it's from SSH config with user
+        // OR if it's marked as using SSH agent (either from SSH config or tracked in sshAgentProfiles)
+        const profileKeyForCheck = `${this.selectedProfile?.hostname}:${this.selectedProfile?.user}`;
+        const shouldUseSshAgent = this.migratedConfigs.some(
+            (config) => config.hostname === this.selectedProfile?.hostname &&
+                       config.user === this.selectedProfile?.user &&
+                       config.useSshAgent
+        ) || this.sshAgentProfiles.has(profileKeyForCheck) || this.selectedProfile?.useSshAgent;
+        
+        // Check if password was provided during validation (it's in validationResult but not yet merged)
+        const hasPassword = this.selectedProfile?.password || this.validationResult?.password;
+        
+        if (!this.selectedProfile?.privateKey && !hasPassword &&
+            !hasUserFromSshConfig && !shouldUseSshAgent) {
             this.showMessage("SSH setup cancelled.", MESSAGE_TYPE.WARNING);
             return;
         }
@@ -395,6 +487,9 @@ export abstract class AbstractConfigManager {
 
     private async validateConfig(newConfig: ISshConfigExt, askForPassword = true): Promise<ISshConfigExt | undefined> {
         const configModifications: ISshConfigExt | undefined = {};
+        // Track if we started with a private key to avoid asking for password later
+        const hadPrivateKeyInitially = !!newConfig.privateKey;
+        
         try {
             const privateKeyPath = newConfig.privateKey;
 
@@ -406,12 +501,36 @@ export abstract class AbstractConfigManager {
                 configModifications.user = userModification;
             }
 
-            if ((!privateKeyPath || !readFileSync(path.normalize(privateKeyPath), "utf-8")) && !newConfig.password) {
+            // Check if we have a private key that can be read
+            let hasValidPrivateKey = false;
+            if (privateKeyPath) {
+                try {
+                    const keyContent = readFileSync(path.normalize(privateKeyPath), "utf-8");
+                    hasValidPrivateKey = keyContent && keyContent.length > 0;
+                } catch (error) {
+                    // Key file doesn't exist or can't be read
+                    hasValidPrivateKey = false;
+                }
+            }
+
+            // Check if this profile should use SSH agent (from SSH config with IdentityAgent)
+            const shouldUseSshAgent = this.migratedConfigs.some(
+                (config) => config.hostname === newConfig.hostname &&
+                           config.user === newConfig.user &&
+                           config.useSshAgent
+            );
+
+            // Only ask for password if we don't have a valid private key, no password is set,
+            // and the profile is not configured to use SSH agent
+            if (!hasValidPrivateKey && !newConfig.password && !shouldUseSshAgent) {
                 const passwordPrompt = askForPassword && (await this.promptForPassword(newConfig, configModifications));
                 return passwordPrompt ? { ...configModifications, ...passwordPrompt } : undefined;
             }
 
-            await this.attemptConnection({ ...newConfig, ...configModifications });
+            const authResult = await this.attemptConnection({ ...newConfig, ...configModifications });
+            if (authResult.usedSshAgent) {
+                configModifications.useSshAgent = true;
+            }
         } catch (err) {
             const errorMessage = `${err}`;
             if (newConfig.privateKey && errorMessage.includes("All configured authentication methods failed")) {
@@ -469,7 +588,10 @@ export abstract class AbstractConfigManager {
             }
 
             if (errorMessage.includes("All configured authentication methods failed")) {
-                const passwordPrompt = askForPassword
+                // Don't ask for password if we originally had a private key from SSH config
+                // This prevents password prompts when SSH key authentication is configured
+                const shouldAskPassword = askForPassword && !hadPrivateKeyInitially;
+                const passwordPrompt = shouldAskPassword
                     ? await this.promptForPassword(newConfig, configModifications)
                     : undefined;
 
@@ -502,23 +624,120 @@ export abstract class AbstractConfigManager {
         return configModifications;
     }
 
-    private async attemptConnection(config: ISshConfigExt): Promise<void> {
+    private async attemptConnection(config: ISshConfigExt): Promise<{ usedSshAgent?: boolean }> {
         const ssh = new NodeSSH();
+        const logger = Logger.getAppLogger();
 
         try {
-            // Prepare connection configuration
-            const connectionConfig = {
-                host: config.hostname,
-                port: config.port || 22,
-                username: config.user,
-                password: config.privateKey ? undefined : config.password,
-                privateKey: config.privateKey ? readFileSync(path.normalize(config.privateKey), "utf8") : undefined,
-                passphrase: config.privateKey ? config.keyPassphrase : undefined,
-                readyTimeout: config.handshakeTimeout || this.getClientSetting("handshakeTimeout") || 30000,
-            };
-
-            // Attempt connection
-            await ssh.connect(connectionConfig);
+            // Try 1: If explicit private key is provided, try it first
+            if (config.privateKey) {
+                try {
+                    logger.info(`[attemptConnection] Trying explicit private key: ${config.privateKey}`);
+                    const connectionConfig: any = {
+                        host: config.hostname,
+                        port: config.port || 22,
+                        username: config.user,
+                        privateKey: readFileSync(path.normalize(config.privateKey), "utf8"),
+                        readyTimeout: config.handshakeTimeout || this.getClientSetting("handshakeTimeout") || 30000,
+                        tryKeyboard: true,
+                    };
+                    if (config.keyPassphrase) {
+                        connectionConfig.passphrase = config.keyPassphrase;
+                    }
+                    
+                    logger.info(`[attemptConnection] Attempting connection with private key to ${config.hostname}:${config.port || 22} as ${config.user}`);
+                    await ssh.connect(connectionConfig);
+                    
+                    if (ssh.isConnected()) {
+                        logger.info(`[attemptConnection] Successfully connected with private key`);
+                        // Test the connection
+                        const result = await ssh.execCommand("exit");
+                        if (result.stderr?.startsWith("FOTS1668")) {
+                            throw new Error("FOTS1668 error detected");
+                        }
+                        return { usedSshAgent: false }; // Success with private key!
+                    }
+                } catch (err) {
+                    logger.info(`[attemptConnection] Private key authentication failed: ${err.message}`);
+                    logger.info(`[attemptConnection] Trying SSH agent as fallback`);
+                    // Disconnect if partially connected
+                    if (ssh.isConnected()) {
+                        ssh.dispose();
+                    }
+                    // Fall through to try SSH agent
+                }
+            }
+            
+            // Try 2: If no private key OR private key failed, try SSH agent (unless password is provided)
+            if (!config.password) {
+                logger.info(`[attemptConnection] Trying SSH agent authentication`);
+                
+                const connectionConfig: any = {
+                    host: config.hostname,
+                    port: config.port || 22,
+                    username: config.user,
+                    readyTimeout: config.handshakeTimeout || this.getClientSetting("handshakeTimeout") || 30000,
+                    tryKeyboard: true,
+                };
+                
+                // Try 1Password agent path first (more reliable than SSH_AUTH_SOCK)
+                const onePasswordAgent = path.join(
+                    require("node:os").homedir(),
+                    "Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
+                );
+                try {
+                    require("node:fs").accessSync(onePasswordAgent);
+                    logger.info(`[attemptConnection] Using 1Password agent: ${onePasswordAgent}`);
+                    connectionConfig.agent = onePasswordAgent;
+                } catch {
+                    logger.info(`[attemptConnection] 1Password agent not available at ${onePasswordAgent}`);
+                    
+                    // Fall back to SSH_AUTH_SOCK if 1Password agent not found
+                    if (process.env.SSH_AUTH_SOCK) {
+                        logger.info(`[attemptConnection] Using SSH agent from SSH_AUTH_SOCK: ${process.env.SSH_AUTH_SOCK}`);
+                        connectionConfig.agent = process.env.SSH_AUTH_SOCK;
+                    } else {
+                        logger.info(`[attemptConnection] No SSH agent found`);
+                    }
+                }
+                
+                if (connectionConfig.agent) {
+                    logger.info(`[attemptConnection] Attempting connection with SSH agent to ${config.hostname}:${config.port || 22} as ${config.user}`);
+                    logger.info(`[attemptConnection] Auth config: agent=${!!connectionConfig.agent}, privateKey=false, password=false`);
+                    
+                    await ssh.connect(connectionConfig);
+                    
+                    if (ssh.isConnected()) {
+                        logger.info(`[attemptConnection] Successfully connected with SSH agent`);
+                        // Test the connection
+                        const result = await ssh.execCommand("exit");
+                        if (result.stderr?.startsWith("FOTS1668")) {
+                            throw new Error("FOTS1668 error detected");
+                        }
+                        return { usedSshAgent: true }; // Success with SSH agent!
+                    }
+                }
+            }
+            
+            // Try 3: If password is provided, use it
+            if (config.password) {
+                logger.info(`[attemptConnection] Using password authentication`);
+                const connectionConfig: any = {
+                    host: config.hostname,
+                    port: config.port || 22,
+                    username: config.user,
+                    password: config.password,
+                    readyTimeout: config.handshakeTimeout || this.getClientSetting("handshakeTimeout") || 30000,
+                    tryKeyboard: true,
+                };
+                
+                logger.info(`[attemptConnection] Attempting connection with password to ${config.hostname}:${config.port || 22} as ${config.user}`);
+                logger.info(`[attemptConnection] Auth config: agent=false, privateKey=false, password=true`);
+                
+                await ssh.connect(connectionConfig);
+            }
+            
+            // Final connection check
             if (!ssh.isConnected()) {
                 throw new Error("Failed to connect to SSH: All configured authentication methods failed");
             }
@@ -527,6 +746,7 @@ export abstract class AbstractConfigManager {
             if (result.stderr?.startsWith("FOTS1668")) {
                 throw new Error(result.stderr);
             }
+            return { usedSshAgent: false }; // Success with password
         } finally {
             ssh.dispose();
         }
@@ -567,8 +787,16 @@ export abstract class AbstractConfigManager {
     private async validateFoundPrivateKeys() {
         // Create a progress bar using the custom Gui.withProgress
         await this.withProgress("Validating Private Keys...", async (progress) => {
+            // Check if this profile should use SSH agent (from SSH config with IdentityAgent)
+            const shouldUseSshAgent = this.migratedConfigs.some(
+                (config) => config.hostname === this.selectedProfile?.hostname &&
+                           config.user === this.selectedProfile?.user &&
+                           config.useSshAgent
+            );
+            
+            // Skip default key validation if profile should use SSH agent
             // Find private keys located at ~/.ssh/ and attempt to connect with them
-            if (!this.validationResult) {
+            if (!this.validationResult && !shouldUseSshAgent) {
                 const foundPrivateKeys = await SshConfigUtils.findPrivateKeys();
                 for (const privateKey of foundPrivateKeys) {
                     const testValidation: ISshConfigExt = { ...this.selectedProfile };
@@ -580,9 +808,35 @@ export abstract class AbstractConfigManager {
 
                     if (result) {
                         this.validationResult = {};
-                        this.selectedProfile = { ...this.selectedProfile, ...result, privateKey };
+                        // If SSH agent was used as fallback, don't include the privateKey
+                        if (result.useSshAgent) {
+                            this.selectedProfile = { ...this.selectedProfile, ...result };
+                            // Track this profile as using SSH agent for later config writing
+                            const profileKey = `${this.selectedProfile.hostname}:${this.selectedProfile.user}`;
+                            this.sshAgentProfiles.add(profileKey);
+                        } else {
+                            // Private key file worked, include it in the profile
+                            this.selectedProfile = { ...this.selectedProfile, ...result, privateKey };
+                        }
                         return;
                     }
+                }
+                
+                // If no private key files worked, try SSH agent authentication
+                // This handles cases where keys are loaded via ssh-add but not in ~/.ssh/config
+                const testValidation: ISshConfigExt = { ...this.selectedProfile };
+                // Don't set privateKey - this will cause SSH library to use agent
+                const result = await this.validateConfig(testValidation, false);
+                
+                if (result) {
+                    this.validationResult = {};
+                    this.selectedProfile = { ...this.selectedProfile, ...result };
+                    // Mark this as an SSH agent profile for proper config handling
+                    this.selectedProfile.useSshAgent = true;
+                    // Track this profile as using SSH agent for later config writing
+                    const profileKey = `${this.selectedProfile.hostname}:${this.selectedProfile.user}`;
+                    this.sshAgentProfiles.add(profileKey);
+                    return;
                 }
             }
 
@@ -607,9 +861,14 @@ export abstract class AbstractConfigManager {
                 progress(100 / validationAttempts.length);
                 if (result !== undefined) {
                     this.validationResult = {};
+                    // Preserve all SSH config parameters from the matched profile
                     this.selectedProfile = {
                         ...this.selectedProfile,
+                        user: testValidation.user || this.selectedProfile.user,
                         privateKey: testValidation.privateKey,
+                        port: testValidation.port || this.selectedProfile.port,
+                        keyPassphrase: testValidation.keyPassphrase,
+                        handshakeTimeout: testValidation.handshakeTimeout || this.selectedProfile.handshakeTimeout,
                     };
                     if (Object.keys(result).length >= 1) {
                         this.selectedProfile = {
@@ -625,20 +884,75 @@ export abstract class AbstractConfigManager {
 
     private async setProfile(selectedConfig: ISshConfigExt, updatedProfile?: string): Promise<void> {
         const configApi = this.mProfilesCache.getTeamConfig().api;
+        
+        // Check if this profile should use SSH agent ONLY (no explicit privateKey in original config)
+        // If a profile has both IdentityAgent and IdentityFile, treat it as a key-based profile
+        // with SSH agent as a fallback, not as an SSH agent-only profile
+        const matchingConfig = this.migratedConfigs.find(
+            (config) => config.hostname === selectedConfig.hostname &&
+                       config.user === selectedConfig.user
+        );
+        // Check both the migrated config AND the selected config for useSshAgent flag
+        // This handles both SSH config profiles and manually created profiles that use SSH agent
+        const shouldUseSshAgent = (matchingConfig?.useSshAgent && !matchingConfig?.privateKey) ||
+                                 (selectedConfig.useSshAgent && !selectedConfig.privateKey);
+        
+        // Determine which fields should be secure based on what's actually present
+        const secureFields: string[] = [];
+        
+        // If using SSH key authentication
+        if (selectedConfig.privateKey) {
+            // Only secure keyPassphrase if it exists
+            if (selectedConfig.keyPassphrase) {
+                secureFields.push("keyPassphrase");
+            }
+            // Don't include password in secure fields when using SSH keys
+        } else if (selectedConfig.password) {
+            // If using password authentication, secure the password
+            secureFields.push("password");
+        } else if (shouldUseSshAgent) {
+            // For SSH agent profiles, explicitly set secure to empty array
+            // This prevents inheriting password from base profile
+            // SSH agent profiles don't need password or privateKey
+        }
+        
         // Create the base config object
         const config: IConfigProfile = {
             type: "ssh",
             properties: {
                 user: selectedConfig.user,
                 host: selectedConfig.hostname,
-                privateKey: selectedConfig.privateKey,
                 port: selectedConfig.port || 22,
-                keyPassphrase: selectedConfig.keyPassphrase,
-                password: selectedConfig.password,
             },
-            //if user, password, or KP is defined, make them secure
-            secure: ["user", "password", "keyPassphrase"].filter((key) => selectedConfig[key as keyof ISshConfigExt]),
+            secure: secureFields,
         };
+        
+        // For SSH agent profiles, do NOT add password, privateKey, or keyPassphrase properties
+        // Omitting these properties entirely prevents Zowe's credential manager from prompting
+        // The SSH agent will be used automatically when no explicit auth is provided
+        if (!shouldUseSshAgent) {
+            // For non-SSH-agent profiles, add authentication properties if they exist
+            if (selectedConfig.privateKey) {
+                config.properties.privateKey = selectedConfig.privateKey;
+            }
+            if (selectedConfig.keyPassphrase) {
+                config.properties.keyPassphrase = selectedConfig.keyPassphrase;
+            }
+            if (selectedConfig.password) {
+                config.properties.password = selectedConfig.password;
+            }
+        }
+        // Note: SSH agent profiles intentionally omit password/privateKey/keyPassphrase
+        // This creates a clean config that works with SSH agent authentication
+
+        // Check if this profile is from SSH config OR uses SSH agent (declare at function scope for later use)
+        const profileKey = `${selectedConfig.hostname}:${selectedConfig.user}`;
+        const isFromSshConfig = this.migratedConfigs.some(
+            (cfg) => cfg.hostname === selectedConfig.hostname &&
+                    cfg.user === selectedConfig.user
+        );
+        const usesSshAgent = selectedConfig.useSshAgent || this.sshAgentProfiles.has(profileKey);
+        const shouldWriteToGlobal = isFromSshConfig || usesSshAgent;
 
         if (updatedProfile) {
             for (const key of Object.keys(selectedConfig)) {
@@ -685,15 +999,86 @@ export abstract class AbstractConfigManager {
                 });
             }
         } else {
-            if (!configApi.profiles.defaultGet("ssh") || !configApi.layers.get().properties.defaults.ssh)
-                configApi.profiles.defaultSet("ssh", selectedConfig.name!);
-            configApi.profiles.set(selectedConfig.name!, config);
+            // Check if profile already exists
+            const existingProfile = configApi.profiles.get(selectedConfig.name!);
+            
+            if (existingProfile) {
+                // Profile exists, update it with new properties (especially privateKey from validation)
+                for (const key of Object.keys(config.properties)) {
+                    const value = config.properties[key];
+                    if (value !== undefined) {
+                        this.mProfilesCache.updateProperty({
+                            profileName: selectedConfig.name!,
+                            profileType: "ssh",
+                            property: key,
+                            value: value,
+                            forceUpdate: true,
+                            setSecure: this.mProfilesCache.isSecured(),
+                        });
+                    }
+                }
+            } else {
+                // Profile doesn't exist, create it
+                // For profiles from SSH config OR using SSH agent, write directly to global config
+                // to avoid base profile creation
+                if (shouldWriteToGlobal) {
+                    const fs = await import("node:fs");
+                    const homeDir = ConfigUtils.getZoweDir();
+                    const globalConfigPath = path.join(homeDir, "zowe.config.json");
+                    
+                    // Read existing global config or create new one
+                    let globalConfig: IConfig;
+                    try {
+                        const content = fs.readFileSync(globalConfigPath, "utf-8");
+                        globalConfig = JSON.parse(content);
+                    } catch {
+                        // File doesn't exist, create new config
+                        globalConfig = {
+                            $schema: "./zowe.schema.json",
+                            profiles: {},
+                            defaults: {},
+                            autoStore: true
+                        };
+                    }
+                    
+                    // Ensure profiles and defaults exist
+                    if (!globalConfig.profiles) {
+                        globalConfig.profiles = {};
+                    }
+                    if (!globalConfig.defaults) {
+                        globalConfig.defaults = {};
+                    }
+                    
+                    // Add the SSH profile
+                    globalConfig.profiles[selectedConfig.name!] = config;
+                    
+                    // Set as default SSH profile if none exists
+                    if (!globalConfig.defaults.ssh) {
+                        globalConfig.defaults.ssh = selectedConfig.name!;
+                    }
+                    
+                    // Write back to global config
+                    fs.writeFileSync(globalConfigPath, JSON.stringify(globalConfig, null, 4), "utf-8");
+                    
+                    // Reload the config to pick up the newly written profile
+                    await this.mProfilesCache.getTeamConfig().reload();
+                } else {
+                    // For manually created profiles, use normal Config API
+                    if (!configApi.profiles.defaultGet("ssh") || !configApi.layers.get().properties.defaults.ssh)
+                        configApi.profiles.defaultSet("ssh", selectedConfig.name!);
+                    configApi.profiles.set(selectedConfig.name!, config);
+                }
+            }
         }
 
-        if (config.secure.length > 0) {
-            await this.mProfilesCache.getTeamConfig().save();
-        } else {
-            this.mProfilesCache.getTeamConfig().api.layers.write();
+        // Save/write for profiles that are NOT from SSH config and NOT using SSH agent
+        // (i.e., manually created profiles with password authentication)
+        if (!shouldWriteToGlobal) {
+            if (config.secure.length > 0) {
+                await this.mProfilesCache.getTeamConfig().save();
+            } else {
+                this.mProfilesCache.getTeamConfig().api.layers.write();
+            }
         }
     }
 
@@ -703,8 +1088,13 @@ export abstract class AbstractConfigManager {
     ): Promise<ISshConfigExt | undefined> {
         let isUniqueName = false;
 
-        // If no name option set then use hostname with all "." replaced with "_"
-        if (!selectedProfile.name) selectedProfile.name = selectedProfile.hostname!.replace(/\./g, "_");
+        // If no name option set then use user@hostname with all "." replaced with "_"
+        // This ensures unique profile names for different users on the same host
+        if (!selectedProfile.name) {
+            const hostPart = selectedProfile.hostname!.replace(/\./g, "_");
+            const userPart = selectedProfile.user ? `${selectedProfile.user}_` : "";
+            selectedProfile.name = `${userPart}${hostPart}`;
+        }
 
         // If selectedProfile already has a name, return it unless an existing profile is found
         if (selectedProfile.name) {
