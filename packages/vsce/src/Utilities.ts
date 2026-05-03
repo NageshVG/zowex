@@ -118,7 +118,7 @@ export function registerCommands(context: vscode.ExtensionContext): vscode.Dispo
         }),
         vscode.commands.registerCommand(`${EXTENSION_NAME}.refreshSshConfig`, async () => {
             imperative.Logger.getAppLogger().trace("Running refreshSshConfig command");
-            const { SshConfigUtils } = await import("zowex-sdk");
+            const { SshConfigUtils } = await import("@zowe/zowex-for-zowe-sdk");
             SshConfigUtils.clearCache();
             const statusMsg = Gui.setStatusBarMessage("SSH config refreshed");
             setTimeout(() => statusMsg.dispose(), 3000);
